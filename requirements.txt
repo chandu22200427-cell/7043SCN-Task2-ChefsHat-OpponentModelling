@@ -1,0 +1,6 @@
+﻿chefshatgym==3.0.0.1
+gym==0.26.2
+numpy
+pandas
+matplotlib
+torch

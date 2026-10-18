@@ -1,0 +1,4 @@
+configuration,baseline_matches,baseline_wins,baseline_win_rate,baseline_average_score,baseline_average_position,dqn_matches,dqn_wins,dqn_win_rate,dqn_average_score,dqn_average_position,win_rate_difference_percentage_points
+all_random,20,6,0.3,1.7,1.3,30,12,0.4,1.9,1.1,10.000000000000004
+all_rule_based,20,13,0.65,2.3,0.7,30,26,0.8666666666666667,2.7666666666666666,0.23333333333333334,21.666666666666668
+mixed,20,7,0.35,1.8,1.2,30,16,0.5333333333333333,2.1666666666666665,0.8333333333333334,18.333333333333336

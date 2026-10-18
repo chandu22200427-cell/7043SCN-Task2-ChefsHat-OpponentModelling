@@ -1,0 +1,15 @@
+﻿.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Model checkpoints
+/Task1_LLM_Finetuning/checkpoints/
+/Task1_LLM_Finetuning/models/
+*.pt
+*.pth
+*.safetensors
+*.bin
+
+# Allow Task 2 model checkpoint
+!/Task2_ChefsHat_OpponentModelling/models/
+!/Task2_ChefsHat_OpponentModelling/models/dqn_opponent_modeling.pt

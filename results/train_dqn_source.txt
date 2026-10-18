@@ -1,0 +1,284 @@
+
+import csv
+import random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+
+from environment_check import create_fixed_match_environment
+from agents import action_to_vector, select_opponent_action
+from dqn_agent import DQNAgent
+
+
+SEED = 42
+TOTAL_MATCHES = 100
+MAX_STEPS = 100_000
+
+PROJECT_DIR = Path(__file__).resolve().parent
+RESULTS_DIR = PROJECT_DIR / "results"
+MODELS_DIR = PROJECT_DIR / "models"
+
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_PATH = RESULTS_DIR / "dqn_training_log.csv"
+SUMMARY_PATH = RESULTS_DIR / "dqn_training_summary.csv"
+CURVE_PATH = RESULTS_DIR / "dqn_training_curve.png"
+MODEL_PATH = MODELS_DIR / "dqn_opponent_modeling.pt"
+
+CONFIGURATIONS = [
+    (
+        "all_random",
+        {
+            "Agent2": "random",
+            "Agent3": "random",
+            "Agent4": "random",
+        },
+    ),
+    (
+        "mixed",
+        {
+            "Agent2": "random",
+            "Agent3": "rule_based",
+            "Agent4": "rule_based",
+        },
+    ),
+    (
+        "all_rule_based",
+        {
+            "Agent2": "rule_based",
+            "Agent3": "rule_based",
+            "Agent4": "rule_based",
+        },
+    ),
+]
+
+
+def main():
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    agent = DQNAgent(seed=SEED)
+
+    # The environment increments its match counter when a match starts.
+    # The extra match lets us capture the requested final completed match
+    # before the next match resets the player states.
+    env, observation, _ = create_fixed_match_environment(
+        number_of_matches=TOTAL_MATCHES + 1,
+        seed=SEED,
+    )
+
+    game = env.unwrapped
+
+    completed_matches = 0
+    total_steps = 0
+    records = []
+    losses = []
+
+    # Pending Agent1 action within the current match.
+    pending_state = None
+    pending_action = None
+
+    original_start_match = game.start_match_handle_cards
+
+    def finish_previous_match():
+        """Capture the previous match before player states are reset."""
+        nonlocal completed_matches
+        nonlocal pending_state, pending_action
+
+        # The wrapper runs before the next match starts.
+        if completed_matches >= TOTAL_MATCHES:
+            original_start_match()
+            return
+
+        player = next(
+            p for p in game.players if p.name == "Agent1"
+        )
+
+        position = int(player.finishing_position)
+        score = int(player.current_score)
+
+        if position not in (0, 1, 2, 3):
+            raise RuntimeError(
+                "Invalid finishing position captured before reset: "
+                f"{position}"
+            )
+
+        if score != 3 - position:
+            raise RuntimeError(
+                f"Inconsistent match result: position={position}, "
+                f"score={score}"
+            )
+
+        # Give the final action its terminal match reward.
+        if pending_state is not None:
+            agent.remember(
+                pending_state,
+                pending_action,
+                score / 3.0,
+                np.asarray(observation, dtype=np.float32),
+                True,
+            )
+
+            loss = agent.train_step()
+            if loss is not None:
+                losses.append(loss)
+
+        completed_matches += 1
+
+        config_name, _ = CONFIGURATIONS[
+            (completed_matches - 1) % len(CONFIGURATIONS)
+        ]
+
+        record = {
+            "episode": completed_matches,
+            "configuration": config_name,
+            "agent1_position": position,
+            "agent1_match_score": score,
+            "win": int(position == 0),
+            "epsilon": agent.epsilon,
+            "steps": total_steps,
+            "latest_loss": losses[-1] if losses else float("nan"),
+        }
+        records.append(record)
+
+        agent.decay_epsilon()
+
+        if completed_matches % 10 == 0:
+            agent.update_target_network()
+
+        print(
+            f"Match {completed_matches:3d}/{TOTAL_MATCHES} | "
+            f"{config_name:14s} | Score: {score} | "
+            f"Position: {position} | Epsilon: {agent.epsilon:.3f}"
+        )
+
+        pending_state = None
+        pending_action = None
+
+        # Let the environment initialise the next match.
+        original_start_match()
+
+    game.start_match_handle_cards = finish_previous_match
+
+    try:
+        while (
+            completed_matches < TOTAL_MATCHES
+            and total_steps < MAX_STEPS
+        ):
+            player_name = game.players[game.currentPlayer].name
+
+            config_index = completed_matches % len(CONFIGURATIONS)
+            _, opponent_policies = CONFIGURATIONS[config_index]
+
+            if player_name == "Agent1":
+                # Store the previous decision as a zero-reward
+                # transition to the next Agent1 decision.
+                if pending_state is not None:
+                    agent.remember(
+                        pending_state,
+                        pending_action,
+                        0.0,
+                        np.asarray(observation, dtype=np.float32),
+                        False,
+                    )
+
+                    loss = agent.train_step()
+                    if loss is not None:
+                        losses.append(loss)
+
+                action_index = agent.select_action(observation)
+
+                pending_state = np.asarray(
+                    observation, dtype=np.float32
+                ).copy()
+                pending_action = action_index
+
+            else:
+                action_index = select_opponent_action(
+                    observation,
+                    opponent_policies[player_name],
+                )
+
+            observation, reward, terminated, truncated, info = env.step(
+                action_to_vector(action_index)
+            )
+            total_steps += 1
+
+        if completed_matches < TOTAL_MATCHES:
+            print(
+                f"WARNING: only {completed_matches} of "
+                f"{TOTAL_MATCHES} matches were captured."
+            )
+
+        if not records:
+            raise RuntimeError("No completed match results were captured.")
+
+        # Save match-level training history.
+        with LOG_PATH.open(
+            "w", newline="", encoding="utf-8"
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=list(records[0].keys()),
+            )
+            writer.writeheader()
+            writer.writerows(records)
+
+        df = pd.DataFrame(records)
+
+        # Summary by opponent configuration.
+        summary = (
+            df.groupby("configuration")
+            .agg(
+                matches=("win", "count"),
+                wins=("win", "sum"),
+                win_rate=("win", "mean"),
+                average_score=("agent1_match_score", "mean"),
+                average_position=("agent1_position", "mean"),
+            )
+            .reset_index()
+        )
+        summary.to_csv(SUMMARY_PATH, index=False)
+
+        # Plot rolling win rate.
+        df["rolling_win_rate"] = (
+            df["win"].rolling(20, min_periods=1).mean()
+        )
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(df["episode"], df["rolling_win_rate"])
+        plt.xlabel("Completed training matches")
+        plt.ylabel("Rolling win rate (last 20 matches)")
+        plt.title("DQN Training Performance")
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        plt.savefig(CURVE_PATH, dpi=300)
+        plt.close()
+
+        # Save the model.
+        agent.save(MODEL_PATH)
+
+        print("\nTraining complete")
+        print("Matches captured:", len(records))
+        print("Environment steps:", total_steps)
+        print("Overall win rate:", round(df["win"].mean(), 3))
+        print("\nOpponent summary:")
+        print(summary.to_string(index=False))
+        print("\nSaved files:")
+        print(LOG_PATH)
+        print(SUMMARY_PATH)
+        print(CURVE_PATH)
+        print(MODEL_PATH)
+
+    finally:
+        game.start_match_handle_cards = original_start_match
+        env.close()
+
+
+if __name__ == "__main__":
+    main()
